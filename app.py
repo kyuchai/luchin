@@ -32,6 +32,7 @@ HEADERS = {
 TWSE_MIS_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
 TWSE_STOCK_URL = "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
 TPEX_STOCK_URL = "https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock"
+TPEX_OPENAPI_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
 TAIEX_HISTORY_URL = "https://www.twse.com.tw/indicesReport/MI_5MINS_HIST"
 MARKET_TURNOVER_URL = "https://www.twse.com.tw/exchangeReport/FMTQIK"
 
@@ -233,29 +234,118 @@ def get_mis_snapshot(stock_id, market):
 
 
 # ============================================================
+# 8-1. TPEx OpenAPI：上櫃最新交易日資料
+# ============================================================
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_tpex_latest_openapi(stock_id):
+    """
+    使用 TPEx 官方 OpenAPI 辨識上櫃股票，並取得最新交易日行情。
+    這個端點不需要 API Key，且比網頁型歷史介面更適合 Render。
+    """
+    try:
+        response = requests.get(
+            TPEX_OPENAPI_URL,
+            timeout=20,
+            headers={
+                "User-Agent": HEADERS["User-Agent"],
+                "Accept": "application/json",
+            },
+        )
+        response.raise_for_status()
+        rows = response.json()
+
+        if not isinstance(rows, list):
+            return None
+
+        for row in rows:
+            code = str(row.get("SecuritiesCompanyCode", "")).strip()
+            if code != stock_id:
+                continue
+
+            date_text = str(row.get("Date", "")).strip()
+            trade_date = pd.NaT
+
+            # TPEx OpenAPI 日期通常為民國年月日，例如 1150821
+            try:
+                if len(date_text) >= 7 and date_text.isdigit():
+                    roc_year = int(date_text[:-4])
+                    month = int(date_text[-4:-2])
+                    day = int(date_text[-2:])
+                    trade_date = pd.Timestamp(
+                        year=roc_year + 1911,
+                        month=month,
+                        day=day,
+                    )
+            except Exception:
+                trade_date = pd.NaT
+
+            return {
+                "股票代號": stock_id,
+                "股票名稱": str(row.get("CompanyName", stock_id)).strip() or stock_id,
+                "日期": trade_date,
+                "時間": "",
+                "開盤價": clean_number(row.get("Open")),
+                "最高價": clean_number(row.get("High")),
+                "最低價": clean_number(row.get("Low")),
+                "目前價": clean_number(row.get("Close")),
+                "收盤價": clean_number(row.get("Close")),
+                "成交股數": clean_number(row.get("TradingShares")),
+                "成交金額": clean_number(row.get("TransactionAmount")),
+                "成交筆數": clean_number(row.get("TransactionNumber")),
+                "資料來源": "TPEx OpenAPI",
+            }
+
+        return None
+
+    except Exception:
+        return None
+
+
+def tpex_openapi_to_snapshot(latest):
+    if not latest:
+        return None
+
+    return {
+        "股票代號": latest["股票代號"],
+        "股票名稱": latest["股票名稱"],
+        "日期": latest["日期"],
+        "時間": "",
+        "最高價": latest["最高價"],
+        "最低價": latest["最低價"],
+        "目前價": latest["收盤價"],
+    }
+
+
+# ============================================================
 # 9. 個股市場辨識
 # ============================================================
 
 def detect_market(stock_id):
+    # 1. 已知特殊指定
     if stock_id in MARKET_OVERRIDES:
         market = MARKET_OVERRIDES[stock_id]
         return (
             market,
-            get_mis_snapshot(
-                stock_id,
-                market
-            )
+            get_mis_snapshot(stock_id, market)
         )
 
-    for market in ["TW", "TWO"]:
-        snapshot = get_mis_snapshot(
-            stock_id,
-            market
-        )
+    # 2. 先查 TWSE MIS（上市）
+    tw_snapshot = get_mis_snapshot(stock_id, "TW")
+    if tw_snapshot:
+        return "TW", tw_snapshot
 
-        if snapshot:
-            return market, snapshot
+    # 3. 再查 TPEx MIS（上櫃盤中）
+    two_snapshot = get_mis_snapshot(stock_id, "TWO")
+    if two_snapshot:
+        return "TWO", two_snapshot
 
+    # 4. TPEx 官方 OpenAPI：Render 上的主要上櫃辨識備援
+    tpex_latest = get_tpex_latest_openapi(stock_id)
+    if tpex_latest:
+        return "TWO", tpex_openapi_to_snapshot(tpex_latest)
+
+    # 5. Yahoo 最後備援
     for market, suffix in [
         ("TW", ".TW"),
         ("TWO", ".TWO")
@@ -336,60 +426,143 @@ def get_twse_stock_month(stock_id, year, month):
 # ============================================================
 
 def get_tpex_stock_month(stock_id, year, month):
+    """
+    TPEx 官方個股歷史月資料。
+    網頁型介面有時會對雲端 IP 比較敏感，因此加入重試與較簡單 Header。
+    若仍失敗，get_stock_range() 會再使用 Yahoo .TWO 歷史資料備援。
+    """
     params = {
         "code": stock_id,
         "date": f"{year}/{month:02d}/01",
         "response": "json"
     }
 
+    request_headers = {
+        "User-Agent": HEADERS["User-Agent"],
+        "Accept": "application/json,text/plain,*/*",
+        "Referer": "https://www.tpex.org.tw/",
+    }
+
+    for attempt in range(3):
+        try:
+            r = requests.get(
+                TPEX_STOCK_URL,
+                params=params,
+                headers=request_headers,
+                timeout=20,
+                allow_redirects=True,
+            )
+
+            r.raise_for_status()
+            j = r.json()
+
+            # 正常回傳 stat=ok 並有 tables
+            if str(j.get("stat", "")).lower() not in {"ok", ""}:
+                return pd.DataFrame()
+
+            tables = j.get("tables", [])
+            if not tables:
+                return pd.DataFrame()
+
+            rows = tables[0].get("data", [])
+            if not rows:
+                return pd.DataFrame()
+
+            df = pd.DataFrame(rows).iloc[:, :9]
+            df.columns = [
+                "日期",
+                "成交張數",
+                "成交仟元",
+                "開盤價",
+                "最高價",
+                "最低價",
+                "收盤價",
+                "漲跌價差",
+                "成交筆數"
+            ]
+
+            df["日期"] = df["日期"].apply(roc_to_datetime)
+
+            for col in df.columns[1:]:
+                df[col] = df[col].apply(clean_number)
+
+            # TPEx 原始欄位：成交張數、成交仟元
+            df["成交股數"] = df["成交張數"] * 1000
+            df["成交金額"] = df["成交仟元"] * 1000
+            df["資料來源"] = "TPEx 官方歷史資料"
+
+            return df[[
+                "日期",
+                "成交股數",
+                "成交金額",
+                "開盤價",
+                "最高價",
+                "最低價",
+                "收盤價",
+                "漲跌價差",
+                "成交筆數",
+                "資料來源",
+            ]]
+
+        except Exception:
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+
+    return pd.DataFrame()
+
+
+def get_yahoo_stock_range(stock_id, market, start_date, end_date):
+    """
+    歷史行情備援。
+    Yahoo 不提供台股每日官方成交金額，因此以 typical price × volume 估算成交金額。
+    只有官方 TPEx 歷史資料取得失敗時才會使用。
+    """
+    suffix = ".TW" if market == "TW" else ".TWO"
+
     try:
-        r = requests.get(
-            TPEX_STOCK_URL,
-            params=params,
-            headers={
-                **HEADERS,
-                "Referer": "https://www.tpex.org.tw/"
-            },
-            timeout=15
+        start = pd.Timestamp(start_date)
+        end = pd.Timestamp(end_date)
+
+        raw = yf.download(
+            stock_id + suffix,
+            start=start.strftime("%Y-%m-%d"),
+            end=(end + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+            progress=False,
+            auto_adjust=False,
+            threads=False,
         )
 
-        r.raise_for_status()
-
-        j = r.json()
-
-        tables = j.get("tables", [])
-
-        if not tables:
+        if raw is None or raw.empty:
             return pd.DataFrame()
 
-        rows = tables[0].get("data", [])
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
 
-        if not rows:
-            return pd.DataFrame()
+        raw = raw.reset_index()
+        raw.rename(columns={
+            "Date": "日期",
+            "Open": "開盤價",
+            "High": "最高價",
+            "Low": "最低價",
+            "Close": "收盤價",
+            "Volume": "成交股數",
+        }, inplace=True)
 
-        df = pd.DataFrame(rows).iloc[:, :9]
+        raw["日期"] = pd.to_datetime(raw["日期"]).dt.tz_localize(None)
 
-        df.columns = [
-            "日期",
-            "成交張數",
-            "成交仟元",
-            "開盤價",
-            "最高價",
-            "最低價",
-            "收盤價",
-            "漲跌價差",
-            "成交筆數"
-        ]
+        for col in ["開盤價", "最高價", "最低價", "收盤價", "成交股數"]:
+            raw[col] = pd.to_numeric(raw[col], errors="coerce")
 
-        df["日期"] = df["日期"].apply(roc_to_datetime)
+        typical_price = (
+            raw["最高價"] + raw["最低價"] + raw["收盤價"]
+        ) / 3
 
-        for col in df.columns[1:]:
-            df[col] = df[col].apply(clean_number)
+        raw["成交金額"] = typical_price * raw["成交股數"]
+        raw["漲跌價差"] = raw["收盤價"].diff()
+        raw["成交筆數"] = np.nan
+        raw["資料來源"] = "Yahoo 歷史備援（成交金額估算）"
 
-        df["成交股數"] = df["成交張數"] * 1000
-        df["成交金額"] = df["成交仟元"] * 1000
-
-        return df[[
+        return raw[[
             "日期",
             "成交股數",
             "成交金額",
@@ -398,7 +571,8 @@ def get_tpex_stock_month(stock_id, year, month):
             "最低價",
             "收盤價",
             "漲跌價差",
-            "成交筆數"
+            "成交筆數",
+            "資料來源",
         ]]
 
     except Exception:
@@ -444,12 +618,42 @@ def get_stock_range(
                 period.month
             )
 
+            # Render / Cloudflare 若擋下 TPEx 歷史頁，改抓 Yahoo .TWO
+            if df.empty:
+                month_start = pd.Timestamp(
+                    year=period.year,
+                    month=period.month,
+                    day=1
+                )
+                month_end = month_start + pd.offsets.MonthEnd(1)
+
+                df = get_yahoo_stock_range(
+                    stock_id,
+                    market,
+                    max(start, month_start),
+                    min(end, month_end)
+                )
+
         if not df.empty:
             all_data.append(df)
 
         time.sleep(0.08)
 
     if not all_data:
+        # 最後整段再嘗試一次 Yahoo，避免月資料全數被 TPEx 擋下
+        if market == "TWO":
+            fallback = get_yahoo_stock_range(
+                stock_id,
+                market,
+                start,
+                end
+            )
+
+            if not fallback.empty:
+                return add_calculation_columns(
+                    fallback.sort_values("日期").reset_index(drop=True)
+                )
+
         return pd.DataFrame()
 
     result = pd.concat(
@@ -458,7 +662,8 @@ def get_stock_range(
     )
 
     result = result.drop_duplicates(
-        subset=["日期"]
+        subset=["日期"],
+        keep="last"
     )
 
     result = result[
@@ -807,9 +1012,7 @@ def get_taiex_intraday():
     show_spinner=False
 )
 def get_today_stock(stock_id):
-    market, snapshot = detect_market(
-        stock_id
-    )
+    market, snapshot = detect_market(stock_id)
 
     if market is None:
         raise ValueError(
@@ -820,6 +1023,48 @@ def get_today_stock(stock_id):
         now_taipei().date()
     )
 
+    # ========================================================
+    # 上櫃：先用 TPEx OpenAPI
+    # ========================================================
+    if market == "TWO":
+        latest = get_tpex_latest_openapi(stock_id)
+
+        if latest:
+            trade_date = latest["日期"]
+            high = latest["最高價"]
+            low = latest["最低價"]
+            turnover = latest["成交金額"]
+
+            # OpenAPI 在休市日會回最近交易日，因此日期照原始資料顯示
+            if (
+                pd.notna(high)
+                and pd.notna(low)
+                and pd.notna(turnover)
+            ):
+                price_range = high - low
+                turnover_billion = turnover / 100_000_000
+                ratio = (
+                    turnover_billion / price_range
+                    if price_range > 0
+                    else np.nan
+                )
+
+                return {
+                    "名稱": f"{stock_id} {latest['股票名稱']}",
+                    "市場名稱": "上櫃",
+                    "日期": trade_date if pd.notna(trade_date) else today,
+                    "時間": "",
+                    "最高價": high,
+                    "最低價": low,
+                    "價差": price_range,
+                    "成交金額(億)": turnover_billion,
+                    "成交金額價差比(億)": ratio,
+                    "資料來源": "TPEx OpenAPI（最新交易日）"
+                }
+
+    # ========================================================
+    # 上市 / TPEx OpenAPI 無資料時：原有官方歷史路徑
+    # ========================================================
     official = get_stock_range(
         stock_id,
         market,
@@ -828,57 +1073,42 @@ def get_today_stock(stock_id):
     )
 
     stock_name = (
-        snapshot.get(
-            "股票名稱",
-            stock_id
-        )
+        snapshot.get("股票名稱", stock_id)
         if snapshot
         else stock_id
     )
 
     if not official.empty:
         row = official.iloc[-1]
+        source = (
+            row.get("資料來源", "官方當日資料")
+            if hasattr(row, "get")
+            else "官方當日資料"
+        )
 
         return {
-            "名稱":
-                f"{stock_id} {stock_name}",
-
-            "市場名稱":
-                MARKET_LABEL[market],
-
-            "日期":
-                row["日期"],
-
-            "時間":
-                "",
-
-            "最高價":
-                row["最高價"],
-
-            "最低價":
-                row["最低價"],
-
-            "價差":
-                row["價差"],
-
-            "成交金額(億)":
-                row["成交金額(億)"],
-
-            "成交金額價差比(億)":
-                row[
-                    "成交金額價差比(億)"
-                ],
-
-            "資料來源":
-                "官方當日資料"
+            "名稱": f"{stock_id} {stock_name}",
+            "市場名稱": MARKET_LABEL[market],
+            "日期": row["日期"],
+            "時間": "",
+            "最高價": row["最高價"],
+            "最低價": row["最低價"],
+            "價差": row["價差"],
+            "成交金額(億)": row["成交金額(億)"],
+            "成交金額價差比(億)": row["成交金額價差比(億)"],
+            "資料來源": str(source)
         }
 
+    # ========================================================
+    # 最後才使用 Yahoo 盤中資料
+    # ========================================================
     intraday = get_stock_intraday(
         stock_id,
         market
     )
 
     if not intraday:
+        # 非交易日：上櫃仍可顯示 OpenAPI 最近交易日，理論上前面已回傳
         raise ValueError(
             "今天沒有可用交易資料。"
         )
@@ -886,60 +1116,30 @@ def get_today_stock(stock_id):
     high = intraday["最高價"]
     low = intraday["最低價"]
     turnover = intraday["成交金額"]
-
     price_range = high - low
-
-    turnover_billion = (
-        turnover
-        /
-        100_000_000
-    )
+    turnover_billion = turnover / 100_000_000
 
     ratio = (
-        turnover_billion
-        /
-        price_range
+        turnover_billion / price_range
         if price_range > 0
         else np.nan
     )
 
     return {
-        "名稱":
-            f"{stock_id} {stock_name}",
-
-        "市場名稱":
-            MARKET_LABEL[market],
-
-        "日期":
-            today,
-
-        "時間":
-            (
-                snapshot.get(
-                    "時間",
-                    ""
-                )
-                if snapshot
-                else ""
-            ),
-
-        "最高價":
-            high,
-
-        "最低價":
-            low,
-
-        "價差":
-            price_range,
-
-        "成交金額(億)":
-            turnover_billion,
-
-        "成交金額價差比(億)":
-            ratio,
-
-        "資料來源":
-            "Yahoo 1分鐘盤中估算"
+        "名稱": f"{stock_id} {stock_name}",
+        "市場名稱": MARKET_LABEL[market],
+        "日期": today,
+        "時間": (
+            snapshot.get("時間", "")
+            if snapshot
+            else ""
+        ),
+        "最高價": high,
+        "最低價": low,
+        "價差": price_range,
+        "成交金額(億)": turnover_billion,
+        "成交金額價差比(億)": ratio,
+        "資料來源": "Yahoo 1分鐘盤中估算"
     }
 
 
@@ -1312,6 +1512,12 @@ def show_range(
         )
 
     st.divider()
+
+    if "資料來源" in df.columns and df["資料來源"].astype(str).str.contains("Yahoo").any():
+        st.warning(
+            "部分上櫃歷史資料因 TPEx 官方歷史介面在雲端環境暫時無法取得，"
+            "已使用 Yahoo 歷史行情備援；該備援的成交金額為估算值。"
+        )
 
     display_df = df[[
         "日期",
